@@ -30,7 +30,8 @@ def PlotImage(quarter):
     # Load the data
     ap = EBaperture(quarter)
     rows, cols = ap.shape
-    file = glob.glob(os.path.join('data', 'Q%d' % quarter, '*.fits'))[0]
+    file = glob.glob(os.path.join('data', 'ngc6791',
+                                  'Q%d' % quarter, '*.fits'))[0]
     with pyfits.open(file) as f:
         flux = f[0].data
 
@@ -39,6 +40,7 @@ def PlotImage(quarter):
     pl.imshow(flux, vmax=1e3)
     PlotAperture(pl.gca(), ap)
     pl.show()
+
 
 if __name__ == '__main__':
     PlotImage(1)
