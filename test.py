@@ -11,6 +11,7 @@ import random
 import os
 import everest
 import celeriteflow as cf
+import keras
 bad_bits = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 16, 17]
 
 
@@ -490,11 +491,14 @@ import tensorflow as tf
 dtype = tf.float64
 
 # Tweakable stuff
-logjitter0 = np.log(0.01)
-l0 = 1e-2
-learning_rate = 1e-2
-niter = 500
-P0 = 10.0
+logjitter0 = np.log(0.01)  # Initial log jitter
+l0 = 1e-2  # Initial L2 regularization variance
+learning_rate = 1e-2  # Initial Adam learning rate
+niter = 500  # Number of iterations
+P0 = 10.0  # Period guess
+H = 2  # Dimension of the hidden layer
+def activate(t):
+    return tf.clip_by_value(t, 0, np.inf)
 
 # This is our design matrix
 X = tf.constant(reg_fluxes.T - 1.0, dtype=dtype)
@@ -515,8 +519,9 @@ Sinvy = tf.linalg.solve(S, y[:, None])
 w0 = tf.matmul(LXT, Sinvy)
 
 # Initial model
-w = tf.Variable(np.zeros(nreg), dtype=dtype)
-model = tf.squeeze(tf.matmul(X, w[:, None]))
+w1 = tf.Variable(np.zeros((nreg, H)), dtype=dtype)
+w2 = tf.Variable(np.zeros((H, 1)), dtype=dtype)
+model = tf.squeeze(tf.matmul(activate(tf.matmul(X, w1)), w2))
 l = tf.constant(l0, dtype=dtype)
 
 # Celerite GP
@@ -534,8 +539,9 @@ loglike = gp.log_likelihood
 
 # Losses
 loss0 = -2 * loglike
-loss1 = (1 / l) * tf.reduce_sum(tf.abs(w))
-loss = loss0 + loss1
+loss1 = (1 / l) * tf.reduce_sum(tf.abs(w1))
+loss2 = (1 / l) * tf.reduce_sum(tf.abs(w2))
+loss = loss0 + loss1 + loss2
 opt = tf.train.AdamOptimizer(learning_rate).minimize(loss)
 
 # Init session
@@ -543,7 +549,14 @@ session = tf.get_default_session()
 if session is None:
     session = tf.InteractiveSession()
 session.run(tf.global_variables_initializer())
-session.run(tf.assign(w, w0.eval()[:, 0]))
+
+w1_0 = 1e-6 * np.random.randn(nreg, H)
+w1_0[:, 0] = w0.eval()[:, 0]
+w2_0 = 1e-6 * np.random.randn(H, 1)
+w2_0[0, 0] = 1
+
+session.run(tf.assign(w1, w1_0))
+session.run(tf.assign(w2, w2_0))
 model0 = model.eval()
 
 # Iterate!
@@ -554,17 +567,20 @@ for i in tqdm(range(niter)):
     losses[i] = loss.eval()
     if losses[i] < best_loss:
         best_loss = losses[i]
-        best_w = w.eval()
+        best_w1 = w1.eval()
+        best_w2 = w2.eval()
         best_logjitter = logjitter.eval()
         best_log_S0 = log_S0.eval()
         best_log_w0 = log_w0.eval()
         best_log_Q = log_Q.eval()
-session.run(tf.assign(w, best_w))
+session.run(tf.assign(w1, best_w1))
+session.run(tf.assign(w2, best_w2))
 session.run(tf.assign(logjitter, best_logjitter))
 session.run(tf.assign(log_S0, best_log_S0))
 session.run(tf.assign(log_w0, best_log_w0))
 session.run(tf.assign(log_Q, best_log_Q))
 
+#
 print("GP stuff:", best_logjitter, best_log_S0, best_log_w0, best_log_Q)
 
 # Plot learning rate
@@ -573,7 +589,11 @@ ax.plot(range(niter), losses)
 
 # Plot weights
 fig, ax = pl.subplots(1)
-ax.plot(np.log10(np.abs(w.eval())))
+ax.imshow(np.log10(np.abs(best_w1)), aspect='auto')
+
+# Plot weights
+fig, ax = pl.subplots(1)
+ax.imshow(np.log10(np.abs(best_w2)), aspect='auto')
 
 # Plot initial model
 fig, ax = pl.subplots(2)
