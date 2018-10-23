@@ -1,4 +1,5 @@
 import numpy as np
+np.random.seed(42)
 import matplotlib.pyplot as pl
 from astropy.io import fits as pyfits
 import glob
@@ -9,6 +10,7 @@ from tqdm import tqdm
 import random
 import os
 import everest
+import celeriteflow as cf
 bad_bits = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 16, 17]
 
 
@@ -483,79 +485,108 @@ time, reg_fluxes, reg_pixels, reg_npix, flux, flux_err = GetTestData()
 ntime = flux.shape[0]
 nreg = reg_fluxes.shape[0]
 
-# Set up pytorch
-import torch
-dtype = torch.float64
-device = torch.device("cpu")
+# Set up tensorflow
+import tensorflow as tf
+dtype = tf.float64
+
+# Tweakable stuff
+logjitter0 = np.log(0.01)
+l0 = 1e-2
+learning_rate = 1e-2
+niter = 500
+P0 = 10.0
 
 # This is our design matrix
-X = torch.tensor(reg_fluxes.T - 1.0, dtype=dtype)
+X = tf.constant(reg_fluxes.T - 1.0, dtype=dtype)
 
 # This is our data we want to fit
-y = torch.tensor(flux - 1.0, dtype=dtype)
+y = tf.constant(flux - 1.0, dtype=dtype)
 
 # This is the data uncertainty
-y_err = torch.tensor(flux_err, dtype=dtype)
+y_err = tf.constant(flux_err, dtype=dtype)
 
-# Compute max like solution
-l = 1e-3
-logjitter = torch.tensor(np.log(0.01), dtype=dtype, requires_grad=True)
-with torch.no_grad():
-    L = torch.diag(torch.ones(nreg, dtype=dtype) * l ** 2)
-    LXT = torch.matmul(L, X.transpose(0, 1))
-    S = torch.matmul(X, torch.matmul(L, X.transpose(0, 1)))
-    S += torch.diag(y_err**2 + torch.exp(2*logjitter))
-    Sinvy, _ = torch.gesv(y[:, None], S)
-    w0 = torch.matmul(LXT, Sinvy)
-
-# Create random Tensors for weights.
-# Setting requires_grad=True indicates that we want to compute gradients with
-# respect to these Tensors during the backward pass.
-w = torch.tensor(w0, device=device, dtype=dtype, requires_grad=True)
-
+# Compute weakly regularized max like solution as a guess
+logjitter = tf.Variable(logjitter0, dtype=dtype)
+L = tf.diag(tf.ones(nreg, dtype=dtype) * l0 ** 2)
+LXT = tf.matmul(L, X, transpose_b=True)
+S = tf.matmul(X, tf.matmul(L, X, transpose_b=True))
+S += tf.diag(y_err**2 + tf.exp(2*logjitter))
+Sinvy = tf.linalg.solve(S, y[:, None])
+w0 = tf.matmul(LXT, Sinvy)
 
 # Initial model
-"""
-model = torch.matmul(X, w).detach().numpy()
-pl.plot(time, flux, 'k.', ms=2, alpha=0.3)
-pl.plot(time, 1 + model, 'r-', lw=0.5)
-pl.show()
-quit()
-"""
+w = tf.Variable(np.zeros(nreg), dtype=dtype)
+model = tf.squeeze(tf.matmul(X, w[:, None]))
+l = tf.constant(l0, dtype=dtype)
+
+# Celerite GP
+t = tf.constant(time, dtype=dtype)
+diag = y_err ** 2 + tf.exp(2*logjitter)
+resid = y - model
+log_S0 = tf.Variable(np.log(np.var(flux)), dtype=dtype)
+log_w0 = tf.Variable(np.log(2 * np.pi / P0), dtype=dtype)
+log_Q = tf.Variable(0.0, dtype=dtype)
+kernel = cf.terms.SHOTerm(log_S0=log_S0,
+                          log_w0=log_w0,
+                          log_Q=log_Q)
+gp = cf.GaussianProcess(kernel, t, resid, diag)
+loglike = gp.log_likelihood
+
+# Losses
+loss0 = -2 * loglike
+loss1 = (1 / l) * tf.reduce_sum(tf.abs(w))
+loss = loss0 + loss1
+opt = tf.train.AdamOptimizer(learning_rate).minimize(loss)
+
+# Init session
+session = tf.get_default_session()
+if session is None:
+    session = tf.InteractiveSession()
+session.run(tf.global_variables_initializer())
+session.run(tf.assign(w, w0.eval()[:, 0]))
+model0 = model.eval()
 
 # Iterate!
-learning_rate = 1e-10
-for t in range(5000):
+losses = np.zeros(niter)
+best_loss = np.inf
+for i in tqdm(range(niter)):
+    session.run(opt)
+    losses[i] = loss.eval()
+    if losses[i] < best_loss:
+        best_loss = losses[i]
+        best_w = w.eval()
+        best_logjitter = logjitter.eval()
+        best_log_S0 = log_S0.eval()
+        best_log_w0 = log_w0.eval()
+        best_log_Q = log_Q.eval()
+session.run(tf.assign(w, best_w))
+session.run(tf.assign(logjitter, best_logjitter))
+session.run(tf.assign(log_S0, best_log_S0))
+session.run(tf.assign(log_w0, best_log_w0))
+session.run(tf.assign(log_Q, best_log_Q))
 
-    # Compute model
-    model = torch.matmul(X, w)
+print("GP stuff:", best_logjitter, best_log_S0, best_log_w0, best_log_Q)
 
-    # Compute and print loss using operations on Tensors.
-    # Now loss is a Tensor of shape (1,)
-    # loss.item() gets the a scalar value held in the loss.
-    loss = 0.5 * ((y - model).pow(2) / (y_err.pow(2) + torch.exp(2*logjitter))).sum()
-    loss += 0.5 * (1 / l ** 2) * torch.sum(w ** 2)
-    print(t, loss.item())
+# Plot learning rate
+fig, ax = pl.subplots(1)
+ax.plot(range(niter), losses)
 
-    # Use autograd to compute the backward pass. This call will compute the
-    # gradient of loss with respect to all Tensors with requires_grad=True.
-    # After this call w.grad will be Tensors holding the gradient
-    # of the loss with respect to w.
-    loss.backward()
+# Plot weights
+fig, ax = pl.subplots(1)
+ax.plot(np.log10(np.abs(w.eval())))
 
-    # Manually update weights using gradient descent. Wrap in torch.no_grad()
-    # because weights have requires_grad=True, but we don't need to track this
-    # in autograd.
-    # An alternative way is to operate on weight.data and weight.grad.data.
-    # Recall that tensor.data gives a tensor that shares the storage with
-    # tensor, but doesn't track history.
-    # You can also use torch.optim.SGD to achieve this.
-    with torch.no_grad():
-        w -= learning_rate * w.grad
-        logjitter -= learning_rate * logjitter.grad
+# Plot initial model
+fig, ax = pl.subplots(2)
+ax[0].set_title("Initial model")
+ax[0].plot(time, flux, 'k.', ms=2, alpha=0.3)
+ax[0].plot(time, 1 + model0, 'r-', lw=0.5)
+ax[1].plot(time, flux - model0, 'k.', ms=2, alpha=0.3)
 
-        # Manually zero the gradients after updating weights
-        w.grad.zero_()
+# Plot final model
+fig, ax = pl.subplots(2)
+ax[0].set_title("Final model")
+ax[0].plot(time, flux, 'k.', ms=2, alpha=0.3)
+ax[0].plot(time, 1 + model.eval(), 'r-', lw=0.5)
+ax[1].plot(time, flux - model.eval(), 'k.', ms=2, alpha=0.3)
 
-
-import pdb; pdb.set_trace()
+pl.show()
