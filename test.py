@@ -12,6 +12,7 @@ import os
 import everest
 import celeriteflow as cf
 import keras
+keras.backend.set_floatx("float64")
 bad_bits = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 16, 17]
 
 
@@ -497,11 +498,6 @@ learning_rate = 1e-2  # Initial Adam learning rate
 niter = 500  # Number of iterations
 P0 = 10.0  # Period guess
 H = 2  # Dimension of the hidden layer
-def activate(t):
-    return tf.clip_by_value(t, 0, np.inf)
-
-# This is our design matrix
-X = tf.constant(reg_fluxes.T - 1.0, dtype=dtype)
 
 # This is our data we want to fit
 y = tf.constant(flux - 1.0, dtype=dtype)
@@ -510,21 +506,23 @@ y = tf.constant(flux - 1.0, dtype=dtype)
 y_err = tf.constant(flux_err, dtype=dtype)
 
 # Compute weakly regularized max like solution as a guess
-logjitter = tf.Variable(logjitter0, dtype=dtype)
-L = tf.diag(tf.ones(nreg, dtype=dtype) * l0 ** 2)
-LXT = tf.matmul(L, X, transpose_b=True)
-S = tf.matmul(X, tf.matmul(L, X, transpose_b=True))
-S += tf.diag(y_err**2 + tf.exp(2*logjitter))
-Sinvy = tf.linalg.solve(S, y[:, None])
-w0 = tf.matmul(LXT, Sinvy)
+X = reg_fluxes.T - 1.0
+L = np.diag(np.ones(nreg) * l0 ** 2)
+LXT = np.dot(L, X.T)
+S = np.dot(X, np.dot(L, X.T))
+S += np.diag(flux_err ** 2 + np.exp(2 * logjitter0))
+Sinvy = np.linalg.solve(S, (flux - 1.0)[:, None])
+wguess = np.dot(LXT, Sinvy)
 
-# Initial model
-w1 = tf.Variable(np.zeros((nreg, H)), dtype=dtype)
-w2 = tf.Variable(np.zeros((H, 1)), dtype=dtype)
-model = tf.squeeze(tf.matmul(activate(tf.matmul(X, w1)), w2))
-l = tf.constant(l0, dtype=dtype)
+# Keras NN model
+nn = keras.Sequential()
+nn.add(keras.layers.Dense(H, activation="softmax", input_dim=nreg))
+nn.add(keras.layers.Dense(1))
+feed_dict = {nn.input: reg_fluxes.T - 1.0}
+model = tf.squeeze(nn.output)
 
 # Celerite GP
+logjitter = tf.Variable(logjitter0, dtype=dtype)
 t = tf.constant(time, dtype=dtype)
 diag = y_err ** 2 + tf.exp(2*logjitter)
 resid = y - model
@@ -538,10 +536,10 @@ gp = cf.GaussianProcess(kernel, t, resid, diag)
 loglike = gp.log_likelihood
 
 # Losses
-loss0 = -2 * loglike
-loss1 = (1 / l) * tf.reduce_sum(tf.abs(w1))
-loss2 = (1 / l) * tf.reduce_sum(tf.abs(w2))
-loss = loss0 + loss1 + loss2
+l = tf.constant(l0, dtype=dtype)
+loss = -2 * loglike
+for w in nn.trainable_weights:
+    loss += (1 / l) * tf.reduce_sum(tf.abs(w))
 opt = tf.train.AdamOptimizer(learning_rate).minimize(loss)
 
 # Init session
@@ -550,31 +548,41 @@ if session is None:
     session = tf.InteractiveSession()
 session.run(tf.global_variables_initializer())
 
+# Assign initial guess for the weights
 w1_0 = 1e-6 * np.random.randn(nreg, H)
-w1_0[:, 0] = w0.eval()[:, 0]
+w1_0[:, 0] = wguess[:, 0]
 w2_0 = 1e-6 * np.random.randn(H, 1)
 w2_0[0, 0] = 1
+session.run(tf.assign(nn.layers[0].kernel, w1_0))
+session.run(tf.assign(nn.layers[0].bias, 0 * np.random.randn(H)))
+session.run(tf.assign(nn.layers[1].kernel, w2_0))
+session.run(tf.assign(nn.layers[1].bias, [-0.5]))
 
-session.run(tf.assign(w1, w1_0))
-session.run(tf.assign(w2, w2_0))
-model0 = model.eval()
+"""
+model0 = model.eval(feed_dict=feed_dict)
+fig, ax = pl.subplots(2)
+ax[0].set_title("Final model")
+ax[0].plot(time, flux - 1, 'k.', ms=2, alpha=0.3)
+ax[0].plot(time, model0, 'r-', lw=0.5)
+pl.show()
+quit()
+"""
 
 # Iterate!
 losses = np.zeros(niter)
 best_loss = np.inf
 for i in tqdm(range(niter)):
-    session.run(opt)
-    losses[i] = loss.eval()
+    session.run(opt, feed_dict=feed_dict)
+    losses[i] = loss.eval(feed_dict=feed_dict)
     if losses[i] < best_loss:
         best_loss = losses[i]
-        best_w1 = w1.eval()
-        best_w2 = w2.eval()
+        best_weights = session.run(nn.trainable_weights)
         best_logjitter = logjitter.eval()
         best_log_S0 = log_S0.eval()
         best_log_w0 = log_w0.eval()
         best_log_Q = log_Q.eval()
-session.run(tf.assign(w1, best_w1))
-session.run(tf.assign(w2, best_w2))
+session.run([
+    tf.assign(a, b) for a, b in zip(nn.trainable_weights, best_weights)])
 session.run(tf.assign(logjitter, best_logjitter))
 session.run(tf.assign(log_S0, best_log_S0))
 session.run(tf.assign(log_w0, best_log_w0))
@@ -588,25 +596,26 @@ fig, ax = pl.subplots(1)
 ax.plot(range(niter), losses)
 
 # Plot weights
-fig, ax = pl.subplots(1)
-ax.imshow(np.log10(np.abs(best_w1)), aspect='auto')
-
-# Plot weights
-fig, ax = pl.subplots(1)
-ax.imshow(np.log10(np.abs(best_w2)), aspect='auto')
+'''
+for w in best_weights:
+    fig, ax = pl.subplots(1)
+    ax.imshow(np.log10(np.abs(w)), aspect='auto')
+'''
 
 # Plot initial model
+'''
 fig, ax = pl.subplots(2)
 ax[0].set_title("Initial model")
 ax[0].plot(time, flux, 'k.', ms=2, alpha=0.3)
 ax[0].plot(time, 1 + model0, 'r-', lw=0.5)
 ax[1].plot(time, flux - model0, 'k.', ms=2, alpha=0.3)
+'''
 
 # Plot final model
 fig, ax = pl.subplots(2)
 ax[0].set_title("Final model")
 ax[0].plot(time, flux, 'k.', ms=2, alpha=0.3)
-ax[0].plot(time, 1 + model.eval(), 'r-', lw=0.5)
-ax[1].plot(time, flux - model.eval(), 'k.', ms=2, alpha=0.3)
+ax[0].plot(time, 1 + model.eval(feed_dict=feed_dict), 'r-', lw=0.5)
+ax[1].plot(time, flux - model.eval(feed_dict=feed_dict), 'k.', ms=2, alpha=0.3)
 
 pl.show()
